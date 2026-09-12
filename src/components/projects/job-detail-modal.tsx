@@ -8,7 +8,7 @@
 import type { ReactNode } from "react";
 import { CheckCircle2, RotateCcw } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 
 export function JobDetailModal({
   open,
@@ -21,6 +21,7 @@ export function JobDetailModal({
   menu,
   main,
   aside,
+  timeline,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -33,14 +34,15 @@ export function JobDetailModal({
   menu?: ReactNode;
   main: ReactNode;
   aside?: ReactNode;
+  timeline?: ReactNode;
 }) {
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex h-[90vh] max-h-[90vh] w-[min(1320px,96vw)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none">
-        <DialogTitle className="sr-only">{title}</DialogTitle>
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent className="flex h-dvh w-[min(920px,96vw)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none">
+        <SheetTitle className="sr-only">{title}</SheetTitle>
 
         {/* Barra de ações */}
-        <div className="flex flex-wrap items-center gap-2 border-b border-border/60 bg-muted/40 px-5 py-3 pr-14">
+        <div className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-2 border-b border-border/60 bg-muted/35 px-5 py-3 pr-14 sm:flex sm:flex-wrap">
           {onToggleDone ? (
             <Button
               size="sm"
@@ -59,7 +61,7 @@ export function JobDetailModal({
               )}
             </Button>
           ) : null}
-          {controls}
+          <div className="flex min-w-0 flex-wrap items-center gap-2">{controls}</div>
           <div className="ml-auto flex items-center gap-1">{menu}</div>
         </div>
 
@@ -73,14 +75,16 @@ export function JobDetailModal({
           ) : null}
         </div>
 
+        {timeline ? <div className="border-t border-border/60 px-5 py-4">{timeline}</div> : null}
+
         {/* Corpo em duas colunas */}
-        <div className="grid min-h-0 flex-1 grid-cols-1 border-t border-border/60 lg:grid-cols-[minmax(0,1fr)_min(480px,36vw)]">
+        <div className="grid min-h-0 flex-1 grid-cols-1 border-t border-border/60 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-h-0 min-w-0 overflow-y-auto lg:border-r lg:border-border/60">
             {main}
           </div>
-          {aside ? <div className="flex min-h-0 min-w-0 flex-col lg:pl-8">{aside}</div> : null}
+          {aside ? <div className="flex min-h-0 min-w-0 flex-col bg-muted/15">{aside}</div> : null}
         </div>
-      </DialogContent>
-    </Dialog>
+      </SheetContent>
+    </Sheet>
   );
 }

@@ -5,6 +5,7 @@
  * do índice único parcial de `notifications` via `insertNotificationsDeduped`.
  */
 import { insertNotificationsDeduped, notificationDedupeKey } from "@/lib/notifications-dedupe";
+import { cleanMentionText } from "@/lib/mentions";
 
 type AnyClient = { from: (table: string) => unknown };
 
@@ -22,14 +23,15 @@ export type MentionNotifyInput = {
 
 const MAX_BODY = 200;
 
-export async function notifyMentions(
+/** Revalida IDs forjáveis e devolve somente membros mencionáveis do workspace. */
+export async function filterMentionableUserIds(
   supabase: AnyClient,
-  input: MentionNotifyInput,
-): Promise<number> {
+  input: Pick<MentionNotifyInput, "brandId" | "authorId" | "mentions">,
+): Promise<string[]> {
   const targets = Array.from(new Set(input.mentions.filter(Boolean))).filter(
     (id) => id !== input.authorId,
   );
-  if (targets.length === 0) return 0;
+  if (targets.length === 0) return [];
 
   // Só notifica quem é membro do workspace (revalidação server-side do escopo).
   const query = supabase.from("brand_members") as {
@@ -51,14 +53,45 @@ export async function notifyMentions(
     .in("user_id", targets);
   if (error) throw error;
   const allowed = (members ?? []).map((m: { user_id: string }) => m.user_id);
-  if (allowed.length === 0) return 0;
+  if (allowed.length === 0) return [];
 
+  // Defesa explícita: o Super Admin global nunca é um destinatário mencionável,
+  // mesmo se um ID forjado chegar ao servidor ou a consulta usar service role.
+  const profileQuery = supabase.from("user_profiles") as {
+    select: (cols: string) => {
+      in: (
+        c: string,
+        v: string[],
+      ) => Promise<{
+        data: Array<{ id: string; is_super_admin: boolean | null }> | null;
+        error: unknown;
+      }>;
+    };
+  };
+  const { data: profiles, error: profileError } = await profileQuery
+    .select("id,is_super_admin")
+    .in("id", allowed);
+  if (profileError) throw profileError;
+  const mentionable = (profiles ?? [])
+    .filter((profile) => profile.is_super_admin !== true)
+    .map((profile) => profile.id);
+  return mentionable;
+}
+
+export async function notifyMentions(
+  supabase: AnyClient,
+  input: MentionNotifyInput,
+): Promise<number> {
+  const mentionable = await filterMentionableUserIds(supabase, input);
+  if (mentionable.length === 0) return 0;
+
+  const cleanBody = cleanMentionText(input.body);
   const snippet =
-    input.body.length > MAX_BODY ? `${input.body.slice(0, MAX_BODY - 1)}…` : input.body;
+    cleanBody.length > MAX_BODY ? `${cleanBody.slice(0, MAX_BODY - 1)}…` : cleanBody;
 
   return insertNotificationsDeduped(
     supabase as never,
-    allowed.map((userId: string) => ({
+    mentionable.map((userId: string) => ({
       user_id: userId,
       brand_id: input.brandId,
       kind: "mention",

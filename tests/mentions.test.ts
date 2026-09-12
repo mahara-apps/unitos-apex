@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { resolveMentions } from "../src/components/ui/mention-textarea";
+import { cleanMentionText } from "../src/lib/mentions";
 import { notifyMentions } from "../src/lib/mention-notify.server";
 
 const people = [
@@ -21,7 +22,11 @@ describe("resolveMentions", () => {
   });
 });
 
-function clientWithMembers(members: string[], inserted: unknown[]) {
+function clientWithMembers(
+  members: string[],
+  inserted: unknown[],
+  superAdmins: string[] = [],
+) {
   return {
     from: (table: string) => {
       if (table === "brand_members") {
@@ -32,6 +37,16 @@ function clientWithMembers(members: string[], inserted: unknown[]) {
                 data: ids.filter((i) => members.includes(i)).map((user_id) => ({ user_id })),
                 error: null,
               }),
+            }),
+          }),
+        };
+      }
+      if (table === "user_profiles") {
+        return {
+          select: () => ({
+            in: (_c: string, ids: string[]) => ({
+              data: ids.map((id) => ({ id, is_super_admin: superAdmins.includes(id) })),
+              error: null,
             }),
           }),
         };
@@ -74,6 +89,16 @@ describe("notifyMentions", () => {
     expect(await notifyMentions(client, { ...base, mentions: ["u1"] })).toBe(0);
     expect(inserted).toHaveLength(0);
   });
+
+  it("nunca notifica o Super Admin global, mesmo com ID enviado manualmente", async () => {
+    const inserted: unknown[] = [];
+    const client = clientWithMembers(["u2", "master"], inserted, ["master"]);
+    expect(
+      await notifyMentions(client, { ...base, mentions: ["u2", "master"] }),
+    ).toBe(1);
+    const rows = inserted[0] as Array<{ user_id: string }>;
+    expect(rows.map((row) => row.user_id)).toEqual(["u2"]);
+  });
 });
 
 describe("menções com token estável", () => {
@@ -92,5 +117,23 @@ describe("menções com token estável", () => {
 
   it("ignora menção legada ambígua entre homônimos", () => {
     expect(resolveMentions("oi @Maria Souza", people)).toEqual([]);
+  });
+});
+
+describe("texto visível de menções", () => {
+  it("remove UUID, colchetes e parênteses de tokens antigos", () => {
+    expect(
+      cleanMentionText(
+        "Oi @[Maria Souza](22222222-2222-2222-2222-222222222222), veja com @Bruno Lima",
+      ),
+    ).toBe("Oi @Maria Souza, veja com @Bruno Lima");
+  });
+
+  it("limpa múltiplas menções e preserva o restante do texto", () => {
+    expect(
+      cleanMentionText(
+        "@[Ana](11111111-1111-1111-1111-111111111111) e @[Bia](22222222-2222-2222-2222-222222222222): https://unitos.app",
+      ),
+    ).toBe("@Ana e @Bia: https://unitos.app");
   });
 });

@@ -1,5 +1,21 @@
 # Roadmap
 
+- [x] Reformular visualmente lista, detalhe e painel de job da área Projetos; preservar ações e sincronizar MASTER 1.3.66.
+- [x] Adicionar reenvio/edição de convites e ocultar o Super Admin global de listas e menções; sincronizar MASTER.
+- [x] Corrigir conclusão prematura do deploy por Git e reconciliar a versão registrada da Casa 8.
+- [ ] Publicar o MASTER 1.3.53 com o diagnóstico correto de domínio/modo de teste/permissão no Resend.
+- [x] Corrigir a corrida de redirecionamento em `/admin` que causava `Uncaught undefined`; sincronizar MASTER 1.3.54.
+- [x] Corrigir seleção de deployment duplicado da Casa 8, reconciliar a versão comprovada e sincronizar MASTER 1.3.55.
+- [x] Corrigir limpeza do modo de manutenção nas retomadas pelo cron, liberar e tentar a atualização da Taveira; MASTER 1.3.56 sincronizado.
+- [ ] Concluir a atualização 1.3.56 da Taveira; bloqueada pela hospedagem, que recusou publicação via REST e exige Git.
+- [x] Corrigir exclusão de clientes com pipelines, adicionar três confirmações e sincronizar a correção no MASTER.
+- [x] Tornar atualizações Git-first, ignorar deployments REST bloqueados e sincronizar o MASTER 1.3.58.
+- [x] Corrigir o modal de tarefa que fica carregando quando o item está fora do filtro atual; sincronizar e propagar o MASTER.
+- [ ] Corrigir o diagnóstico de validação para separar Banco, Schema, RLS e Seeds; código concluído no MASTER 1.3.60, aguardando publicação para atualizar e revalidar a Apex.
+- [x] Evitar tela branca quando a leitura de permissões sofre Gateway Timeout, consultando o Supabase diretamente com identidade protegida.
+- [x] Criar automações de WhatsApp por cliente com agenda, eventos, destino padrão, retries e ativação pelo Super Admin.
+- [x] Padronizar textos visíveis em PT-BR e datas/horários humanos com fuso de Brasília e segundos; sincronizar MASTER 1.3.63.
+- [x] Exibir somente o nome nas menções de comentários e conversas, saneando marcadores técnicos; sincronizar MASTER 1.3.64.
 - [x] Publicar o MASTER 1.3.7 e atualizar a Taveira, com validação final.
 - [x] Tornar a ação de atualização inequívoca e proteger o reprovisionamento na tela.
 - [x] Concluir Lixeira de conteúdos/pipelines com retenção de 30 dias e propagação MASTER.
@@ -32,3 +48,11 @@
 - [x] Corrigir automaticamente `unitos-casa8` para o nome real `unitos-casa-8` após validar o acesso.
 - [x] Reutilizar o nome confirmado em todas as etapas seguintes de publicação.
 - [ ] Publicar o MASTER e executar “Testar acesso” na Casa 8; depende da sessão do Super Admin.
+
+- [x] Reformular a apresentação do plano de mídia em cartões, planilha enxuta e painel lateral; manter os 12 campos e funções.
+
+- [x] Reformular apresentação de Pautas (/monthly-plan e detalhe), preservar todas as funções e adicionar seleção segura de modelo no assistente.
+- [x] Reformular apenas a apresentação de Conteúdo (/content), preservando Kanban, lista, seleção e editor completos.
+- [x] Reorganizar Jobs & Pautas, criar quadro de jobs e drawer com Lista/Quadro de tarefas; sincronizar no MASTER 1.3.69.
+- [x] Impedir tela de erro quando o contador de mensagens roda durante perda ou renovação da sessão; sincronizar no MASTER 1.3.70.
+- [x] Eliminar bloqueios falsos de token nas instalações, unificar a leitura do cofre no runtime e distinguir acesso ausente de ilegível; sincronizar no MASTER 1.3.71.

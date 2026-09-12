@@ -5,6 +5,7 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { cleanMentionText } from "@/lib/mentions";
 
 export type WorkComment = {
   id: string;
@@ -67,7 +68,7 @@ export const listWorkCommentsFn = createServerFn({ method: "GET" })
       author_id: c.author_id,
       author_name: map.get(c.author_id)?.full_name ?? null,
       author_avatar: map.get(c.author_id)?.avatar_url ?? null,
-      body: c.body,
+      body: cleanMentionText(c.body),
       mentions: c.mentions ?? [],
       created_at: c.created_at,
     }));
@@ -87,6 +88,12 @@ export const addWorkCommentFn = createServerFn({ method: "POST" })
       .parse(i),
   )
   .handler(async ({ data, context }) => {
+    const { filterMentionableUserIds } = await import("@/lib/mention-notify.server");
+    const mentions = await filterMentionableUserIds(context.supabase, {
+      brandId: data.brandId,
+      authorId: context.userId,
+      mentions: data.mentions ?? [],
+    });
     const { data: inserted, error } = await context.supabase
       .from("work_comments")
       .insert({
@@ -94,14 +101,13 @@ export const addWorkCommentFn = createServerFn({ method: "POST" })
         project_id: data.projectId,
         job_id: data.jobId ?? null,
         author_id: context.userId,
-        body: data.body,
-        mentions: data.mentions ?? [],
+        body: cleanMentionText(data.body),
+        mentions,
       } as never)
       .select("id")
       .single();
     if (error) throw error;
 
-    const mentions = data.mentions ?? [];
     if (mentions.length > 0) {
       const { notifyMentionsSafe } = await import("@/lib/mention-notify.server");
       const href = data.jobId
@@ -113,7 +119,7 @@ export const addWorkCommentFn = createServerFn({ method: "POST" })
         mentions,
         commentId: (inserted as { id: string } | null)?.id ?? null,
         title: data.jobId ? "Você foi mencionado em um job" : "Você foi mencionado em um projeto",
-        body: data.body,
+        body: cleanMentionText(data.body),
         href,
       });
     }

@@ -96,6 +96,7 @@ export type OperationDetail = {
     updateDeploymentId?: string;
     updateDeploymentSource?: "git" | "rebuild";
     updateDeploymentRef?: string;
+    updateGitPushCommit?: string;
   };
 };
 
@@ -418,6 +419,26 @@ async function assertSupabaseManagementAccess(input: {
   }
 }
 
+async function prevalidateSupabaseOperation(input: {
+  env: Record<string, string | undefined>;
+  supabaseProjectRef?: string | null;
+  supabaseUrl?: string | null;
+  requireKeys?: boolean;
+}): Promise<void> {
+  const token = (input.env["UNITOS_SUPABASE_MANAGEMENT_TOKEN"] ?? "").trim();
+  if (!token) {
+    throw new Error(
+      "Supabase Access Token ausente. Configure o acesso antes de iniciar a operação.",
+    );
+  }
+  await assertSupabaseManagementAccess({
+    token,
+    supabaseProjectRef: input.supabaseProjectRef,
+    supabaseUrl: input.supabaseUrl,
+    requireKeys: input.requireKeys,
+  });
+}
+
 /**
  * Cadastro de instalação no modelo BYOK: o Supabase Access Token do cliente é
  * obrigatório e gravado cifrado no mesmo passo. Se a gravação falhar, o
@@ -659,20 +680,17 @@ export const setInstallationServiceStateFn = createServerFn({ method: "POST" })
       );
     }
 
-    const { createManagementClient } = await import("./automation.server");
-    const { buildServiceStateSql } = await import("./service-state.server");
-    const management = createManagementClient({ token, projectRef: record.supabaseProjectRef });
-    const res = await management.query(
-      buildServiceStateSql({
-        state: data.state,
-        message: suspend ? reason : null,
-        untilIso: null,
-        actor: context.userId,
-      }),
-    );
-    if (!res.ok) {
+    const { setRemoteInstallationServiceState } = await import("./service-state.server");
+    const changed = await setRemoteInstallationServiceState({
+      env,
+      projectRef: record.supabaseProjectRef,
+      state: data.state,
+      actor: context.userId,
+      preserveSuspended: false,
+    });
+    if (!changed) {
       throw new Error(
-        `Não foi possível ${suspend ? "suspender" : "reativar"} o ambiente: ${res.error ?? "falha ao falar com o banco da instalação"}`,
+        `Não foi possível ${suspend ? "suspender" : "reativar"} o ambiente: falha ao falar com o banco da instalação`,
       );
     }
 
@@ -1114,6 +1132,14 @@ async function openAutomatedProvision(
     );
   }
 
+  // Teste efetivo antes de criar a operação: token revogado, projeto incorreto
+  // ou indisponibilidade são informados sem deixar uma operação BLOCKED órfã.
+  await prevalidateSupabaseOperation({
+    env,
+    supabaseProjectRef: record.supabaseProjectRef,
+    supabaseUrl: record.supabaseUrl,
+  });
+
   const { data: active } = await supabase
     .from("installation_operations")
     .select("id")
@@ -1238,6 +1264,13 @@ export const runAutomatedValidateFn = createServerFn({ method: "POST" })
         `A instalação está em “${INSTALLATION_STATUS_LABEL[record.status]}” e não aceita esta operação agora.`,
       );
     }
+
+    await prevalidateSupabaseOperation({
+      env,
+      supabaseProjectRef: record.supabaseProjectRef,
+      supabaseUrl: record.supabaseUrl,
+      requireKeys: false,
+    });
 
     const { data: active } = await context.supabase
       .from("installation_operations")
@@ -1614,8 +1647,7 @@ export const runAutomatedUpdateFn = createServerFn({ method: "POST" })
 
     const { runAutomatedUpdate } = await import("./automation.server");
     const { waitUntil } = await import("@/lib/wait-until.server");
-    const { createManagementClient } = await import("./automation.server");
-    const { buildServiceStateSql } = await import("./service-state.server");
+    const { setRemoteInstallationServiceState } = await import("./service-state.server");
 
     /**
      * Aviso no ambiente do cliente: durante a atualização o banco muda e o
@@ -1624,26 +1656,12 @@ export const runAutomatedUpdateFn = createServerFn({ method: "POST" })
      * aviso expira sozinho e o ambiente nunca fica travado.
      */
     const setServiceState = async (state: "maintenance" | "active") => {
-      const token = (env["UNITOS_SUPABASE_MANAGEMENT_TOKEN"] ?? "").trim();
-      if (!token || !record.supabaseProjectRef) return;
-      try {
-        const management = createManagementClient({
-          token,
-          projectRef: record.supabaseProjectRef,
-        });
-        await management.query(
-          buildServiceStateSql({
-            state,
-            message:
-              state === "maintenance" ? "Atualização em andamento — evite salvar agora." : null,
-            untilIso:
-              state === "maintenance" ? new Date(Date.now() + 30 * 60_000).toISOString() : null,
-            actor: context.userId,
-          }),
-        );
-      } catch {
-        // Aviso é best-effort: nunca impede a atualização.
-      }
+      await setRemoteInstallationServiceState({
+        env,
+        projectRef: record.supabaseProjectRef,
+        state,
+        actor: context.userId,
+      });
     };
 
     await setServiceState("maintenance");

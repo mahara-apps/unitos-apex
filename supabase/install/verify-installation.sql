@@ -67,6 +67,16 @@ WITH checks AS (
                                WHERE n.nspname = 'public' AND p.proname = 'can_access_message_thread')
               THEN 'PASS' ELSE 'FAIL' END
   UNION ALL
+  SELECT 17, 'tarefas: estado Bloqueada disponível',
+         CASE WHEN EXISTS (SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+                           JOIN pg_namespace n ON n.oid = t.typnamespace
+                           WHERE n.nspname = 'public' AND t.typname = 'task_status'
+                             AND e.enumlabel = 'blocked') THEN 'presente' ELSE 'ausente' END,
+         CASE WHEN EXISTS (SELECT 1 FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid
+                           JOIN pg_namespace n ON n.oid = t.typnamespace
+                           WHERE n.nspname = 'public' AND t.typname = 'task_status'
+                             AND e.enumlabel = 'blocked') THEN 'PASS' ELSE 'FAIL' END
+  UNION ALL
   SELECT 134, 'módulo Mensagens: criação atômica de conversa (create_message_thread)',
          (SELECT count(*)::text FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
           WHERE n.nspname = 'public' AND p.proname = 'create_message_thread')
@@ -80,6 +90,25 @@ WITH checks AS (
                               AND p.prosecdef
                               AND has_function_privilege('authenticated', p.oid, 'EXECUTE'))
               THEN 'PASS' ELSE 'FAIL' END
+  UNION ALL
+
+  SELECT 135, 'clientes: cascata pode remover o último pipeline',
+         CASE WHEN EXISTS (
+           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+           WHERE n.nspname = 'public'
+             AND p.proname = 'protect_pipeline_delete'
+             AND p.prosrc LIKE '%IF NOT EXISTS (%'
+             AND p.prosrc LIKE '%FROM public.clients%'
+         ) THEN 'proteção compatível com cascata' ELSE 'função desatualizada' END,
+         CASE WHEN EXISTS (
+           SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+           WHERE n.nspname = 'public'
+             AND p.proname = 'protect_pipeline_delete'
+             AND p.prosrc LIKE '%IF NOT EXISTS (%'
+             AND p.prosrc LIKE '%FROM public.clients%'
+             AND NOT has_function_privilege('anon', p.oid, 'EXECUTE')
+             AND NOT has_function_privilege('authenticated', p.oid, 'EXECUTE')
+         ) THEN 'PASS' ELSE 'FAIL' END
   UNION ALL
 
   SELECT 132, 'módulo Mensagens: tempo real (publicação supabase_realtime)',
@@ -150,9 +179,11 @@ WITH checks AS (
          (SELECT count(*)::text FROM public.agent_prompts),
          CASE WHEN (SELECT count(*) FROM public.agent_prompts) >= 9 THEN 'PASS' ELSE 'FAIL' END
   UNION ALL
-  SELECT 41, 'seeds: feature_catalog (esperado >= 14)',
+  SELECT 41, 'seeds: feature_catalog (esperado >= 15 e automations desligado)',
          (SELECT count(*)::text FROM public.feature_catalog),
-         CASE WHEN (SELECT count(*) FROM public.feature_catalog) >= 14 THEN 'PASS' ELSE 'FAIL' END
+         CASE WHEN (SELECT count(*) FROM public.feature_catalog) >= 15
+                    AND EXISTS (SELECT 1 FROM public.feature_catalog WHERE key = 'automations' AND default_enabled = false)
+              THEN 'PASS' ELSE 'FAIL' END
   UNION ALL
   SELECT 42, 'seeds: brain_retention_config (esperado >= 7)',
          (SELECT count(*)::text FROM public.brain_retention_config),
@@ -370,6 +401,19 @@ WITH checks AS (
                            WHERE jobname = 'purge-deleted-content-30d'
                              AND command LIKE '%purge_deleted_content%')
               THEN 'PASS' ELSE 'FAIL' END
+  UNION ALL
+  SELECT 66, 'cron: retomada do gerenciador usa a URL registrada',
+         CASE WHEN NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'installation-provision-resume')
+              THEN 'não se aplica nesta instalação'
+              ELSE coalesce((SELECT command FROM cron.job
+                             WHERE jobname = 'installation-provision-resume' LIMIT 1), 'ausente') END,
+         CASE WHEN NOT EXISTS (SELECT 1 FROM cron.job WHERE jobname = 'installation-provision-resume') THEN 'PASS'
+              WHEN EXISTS (
+                SELECT 1 FROM cron.job
+                WHERE jobname = 'installation-provision-resume'
+                  AND command LIKE '%' || rtrim((SELECT app_url FROM public.installation LIMIT 1), '/') || '/api/public/cron/installation-resume%'
+                  AND command LIKE '%x-cron-secret%'
+              ) THEN 'PASS' ELSE 'FAIL' END
 
   -- ---------------------------------------------------------------- brain_stats_mv
   UNION ALL
@@ -393,7 +437,8 @@ WITH checks AS (
                'installation_meta_app','message_thread_participants','message_threads',
                'messages','portal_notification_prefs','post_client_comments','post_copy_queue_state',
                'client_ad_accounts','project_participants','user_login_events','work_comments',
-               'work_links','work_statuses'
+                'work_links','work_statuses','client_automation_attempts',
+                'client_automation_dates','client_automation_dispatches','client_automation_rules'
              ]) AS t
              WHERE to_regclass('public.' || t) IS NULL
            ) faltando
@@ -407,7 +452,8 @@ WITH checks AS (
              'installation_meta_app','message_thread_participants','message_threads',
              'messages','portal_notification_prefs','post_client_comments','post_copy_queue_state',
              'client_ad_accounts','project_participants','user_login_events','work_comments',
-             'work_links','work_statuses'
+              'work_links','work_statuses','client_automation_attempts',
+              'client_automation_dates','client_automation_dispatches','client_automation_rules'
            ]) AS t
            WHERE to_regclass('public.' || t) IS NULL
          ) THEN 'PASS' ELSE 'FAIL' END
