@@ -5508,3 +5508,782 @@ REVOKE ALL ON FUNCTION public.heartbeat_installation_operation(uuid, text, integ
 GRANT EXECUTE ON FUNCTION public.claim_installation_operation(uuid, text, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.claim_stale_installation_operations(text, integer, integer) TO service_role;
 GRANT EXECUTE ON FUNCTION public.heartbeat_installation_operation(uuid, text, integer) TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 20260913134042_7bfb010a-d85e-46a0-89b6-782f1e4f545f.sql
+-- ---------------------------------------------------------------------------
+CREATE TABLE public.project_job_counters (
+  brand_id uuid PRIMARY KEY REFERENCES public.brands(id) ON DELETE CASCADE,
+  next_number bigint NOT NULL DEFAULT 1,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
+GRANT SELECT, INSERT, UPDATE ON public.project_job_counters TO authenticated;
+GRANT ALL ON public.project_job_counters TO service_role;
+ALTER TABLE public.project_job_counters ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "project_job_counters_read" ON public.project_job_counters
+  FOR SELECT TO authenticated
+  USING (public.brand_member_role(auth.uid(), brand_id) IS NOT NULL);
+
+ALTER TABLE public.project_jobs
+  ADD COLUMN job_number bigint,
+  ADD COLUMN estimated_minutes integer;
+
+WITH numbered AS (
+  SELECT id, brand_id,
+         row_number() OVER (PARTITION BY brand_id ORDER BY created_at, id)::bigint AS seq
+  FROM public.project_jobs
+)
+UPDATE public.project_jobs j
+SET job_number = numbered.seq
+FROM numbered
+WHERE numbered.id = j.id;
+
+INSERT INTO public.project_job_counters (brand_id, next_number)
+SELECT brand_id, COALESCE(max(job_number), 0) + 1
+FROM public.project_jobs
+GROUP BY brand_id
+ON CONFLICT (brand_id) DO UPDATE
+SET next_number = GREATEST(public.project_job_counters.next_number, EXCLUDED.next_number),
+    updated_at = now();
+
+ALTER TABLE public.project_jobs
+  ALTER COLUMN job_number SET NOT NULL,
+  ADD CONSTRAINT project_jobs_estimated_minutes_nonnegative CHECK (estimated_minutes IS NULL OR estimated_minutes >= 0),
+  ADD CONSTRAINT project_jobs_brand_number_unique UNIQUE (brand_id, job_number);
+
+CREATE OR REPLACE FUNCTION public.assign_project_job_number()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  _number bigint;
+BEGIN
+  IF NEW.job_number IS NOT NULL THEN
+    RETURN NEW;
+  END IF;
+  INSERT INTO public.project_job_counters (brand_id, next_number)
+  VALUES (NEW.brand_id, 2)
+  ON CONFLICT (brand_id) DO UPDATE
+    SET next_number = public.project_job_counters.next_number + 1,
+        updated_at = now()
+  RETURNING next_number - 1 INTO _number;
+  NEW.job_number := _number;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER project_jobs_assign_number
+BEFORE INSERT ON public.project_jobs
+FOR EACH ROW EXECUTE FUNCTION public.assign_project_job_number();
+
+CREATE OR REPLACE FUNCTION public.prevent_project_job_number_change()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = public
+AS $$
+BEGIN
+  IF NEW.job_number IS DISTINCT FROM OLD.job_number THEN
+    RAISE EXCEPTION 'O número do job é imutável';
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE TRIGGER project_jobs_number_immutable
+BEFORE UPDATE OF job_number ON public.project_jobs
+FOR EACH ROW EXECUTE FUNCTION public.prevent_project_job_number_change();
+
+ALTER TABLE public.work_statuses
+  ADD COLUMN task_state public.task_status;
+
+CREATE UNIQUE INDEX work_statuses_brand_scope_name_ci_uidx
+  ON public.work_statuses (brand_id, scope, lower(name));
+
+ALTER TABLE public.task_time_entries
+  ALTER COLUMN task_id DROP NOT NULL,
+  ADD COLUMN job_id uuid REFERENCES public.project_jobs(id) ON DELETE CASCADE,
+  ADD CONSTRAINT task_time_entries_one_target CHECK ((task_id IS NOT NULL) <> (job_id IS NOT NULL));
+
+CREATE INDEX task_time_entries_job_idx ON public.task_time_entries (job_id, started_at DESC)
+  WHERE job_id IS NOT NULL;
+
+DROP POLICY IF EXISTS "time_entries read via parent task" ON public.task_time_entries;
+DROP POLICY IF EXISTS "time_entries own insert via parent task" ON public.task_time_entries;
+DROP POLICY IF EXISTS "time_entries own update via parent task" ON public.task_time_entries;
+DROP POLICY IF EXISTS "time_entries own delete via parent task" ON public.task_time_entries;
+
+CREATE POLICY "time_entries read via work target" ON public.task_time_entries
+  FOR SELECT TO authenticated
+  USING (
+    (task_id IS NOT NULL AND public.can_access_task(task_id, auth.uid()))
+    OR
+    (job_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM public.project_jobs j
+      WHERE j.id = job_id AND public.can_access_project(j.project_id, auth.uid())
+    ))
+  );
+CREATE POLICY "time_entries own insert via work target" ON public.task_time_entries
+  FOR INSERT TO authenticated
+  WITH CHECK (
+    user_id = auth.uid() AND (
+      (task_id IS NOT NULL AND public.can_access_task(task_id, auth.uid()))
+      OR
+      (job_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.project_jobs j
+        WHERE j.id = job_id AND public.can_access_project(j.project_id, auth.uid())
+      ))
+    )
+  );
+CREATE POLICY "time_entries own update via work target" ON public.task_time_entries
+  FOR UPDATE TO authenticated
+  USING (user_id = auth.uid())
+  WITH CHECK (
+    user_id = auth.uid() AND (
+      (task_id IS NOT NULL AND public.can_access_task(task_id, auth.uid()))
+      OR
+      (job_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.project_jobs j
+        WHERE j.id = job_id AND public.can_access_project(j.project_id, auth.uid())
+      ))
+    )
+  );
+CREATE POLICY "time_entries own delete via work target" ON public.task_time_entries
+  FOR DELETE TO authenticated
+  USING (
+    user_id = auth.uid() AND (
+      (task_id IS NOT NULL AND public.can_access_task(task_id, auth.uid()))
+      OR
+      (job_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.project_jobs j
+        WHERE j.id = job_id AND public.can_access_project(j.project_id, auth.uid())
+      ))
+    )
+  );
+
+CREATE OR REPLACE FUNCTION public.start_job_timer(_job_id uuid, _brand_id uuid)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  _uid uuid := auth.uid();
+  _new_id uuid;
+  _now timestamptz := now();
+  _project_id uuid;
+BEGIN
+  IF _uid IS NULL THEN RAISE EXCEPTION 'Unauthenticated'; END IF;
+  SELECT project_id INTO _project_id
+  FROM public.project_jobs
+  WHERE id = _job_id AND brand_id = _brand_id;
+  IF _project_id IS NULL OR NOT public.can_access_project(_project_id, _uid) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  UPDATE public.task_time_entries
+  SET ended_at = _now,
+      seconds = GREATEST(0, ROUND(EXTRACT(EPOCH FROM (_now - started_at)))::int),
+      minutes = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (_now - started_at)) / 60.0)::int),
+      ended_reason = 'auto'
+  WHERE user_id = _uid AND ended_at IS NULL;
+
+  INSERT INTO public.task_time_entries (job_id, user_id, brand_id, started_at, source)
+  VALUES (_job_id, _uid, _brand_id, _now, 'timer')
+  RETURNING id INTO _new_id;
+
+  INSERT INTO public.activity_events (brand_id, actor_id, entity_type, entity_id, verb, payload)
+  VALUES (_brand_id, _uid, 'job', _job_id, 'timer_started', '{}'::jsonb);
+  RETURN _new_id;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.start_job_timer(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.start_job_timer(uuid, uuid) TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.log_project_job_activity()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE _client_id uuid;
+BEGIN
+  SELECT client_id INTO _client_id FROM public.projects WHERE id = NEW.project_id;
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+    VALUES (NEW.brand_id, _client_id, auth.uid(), 'job', NEW.id, 'created', jsonb_build_object('title', NEW.name, 'job_number', NEW.job_number));
+  ELSE
+    IF OLD.status_id IS DISTINCT FROM NEW.status_id THEN
+      INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+      VALUES (NEW.brand_id, _client_id, auth.uid(), 'job', NEW.id, 'status_changed', jsonb_build_object('from', OLD.status_id, 'to', NEW.status_id));
+    END IF;
+    IF OLD.done_at IS DISTINCT FROM NEW.done_at THEN
+      INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+      VALUES (NEW.brand_id, _client_id, auth.uid(), 'job', NEW.id, CASE WHEN NEW.done_at IS NULL THEN 'reopened' ELSE 'completed' END, '{}'::jsonb);
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER project_jobs_activity
+AFTER INSERT OR UPDATE ON public.project_jobs
+FOR EACH ROW EXECUTE FUNCTION public.log_project_job_activity();
+
+CREATE OR REPLACE FUNCTION public.log_task_activity()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+    VALUES (NEW.brand_id, NEW.client_id, NEW.created_by, 'task', NEW.id, 'created', jsonb_build_object('title', NEW.title, 'job_id', NEW.job_id));
+  ELSIF OLD.status IS DISTINCT FROM NEW.status OR OLD.status_id IS DISTINCT FROM NEW.status_id THEN
+    INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+    VALUES (NEW.brand_id, NEW.client_id, auth.uid(), 'task', NEW.id, 'status_changed', jsonb_build_object('from', OLD.status, 'to', NEW.status, 'status_id', NEW.status_id, 'title', NEW.title, 'job_id', NEW.job_id));
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.log_work_timer_stop()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE _client_id uuid;
+DECLARE _target_job uuid;
+BEGIN
+  IF OLD.ended_at IS NULL AND NEW.ended_at IS NOT NULL THEN
+    IF NEW.job_id IS NOT NULL THEN
+      _target_job := NEW.job_id;
+      SELECT p.client_id INTO _client_id FROM public.project_jobs j JOIN public.projects p ON p.id = j.project_id WHERE j.id = NEW.job_id;
+    ELSE
+      SELECT t.job_id, t.client_id INTO _target_job, _client_id FROM public.tasks t WHERE t.id = NEW.task_id;
+    END IF;
+    IF _target_job IS NOT NULL THEN
+      INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+      VALUES (NEW.brand_id, _client_id, NEW.user_id, 'job', _target_job,
+        CASE WHEN NEW.ended_reason = 'pause' THEN 'timer_paused' ELSE 'timer_stopped' END,
+        jsonb_build_object('task_id', NEW.task_id, 'seconds', NEW.seconds));
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+CREATE TRIGGER work_timer_stop_activity
+AFTER UPDATE OF ended_at ON public.task_time_entries
+FOR EACH ROW EXECUTE FUNCTION public.log_work_timer_stop();
+
+CREATE TRIGGER project_job_counters_touch
+BEFORE UPDATE ON public.project_job_counters
+FOR EACH ROW EXECUTE FUNCTION public.update_updated_at_column();
+
+-- ---------------------------------------------------------------------------
+-- 20260913134209_6fd4e9e8-ecac-4452-a0b1-c3b0c0d6fa7c.sql
+-- ---------------------------------------------------------------------------
+ALTER FUNCTION public.start_job_timer(uuid, uuid) SECURITY INVOKER;
+REVOKE ALL ON FUNCTION public.assign_project_job_number() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.prevent_project_job_number_change() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.log_project_job_activity() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.log_task_activity() FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.log_work_timer_stop() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.assign_project_job_number() TO service_role;
+GRANT EXECUTE ON FUNCTION public.prevent_project_job_number_change() TO service_role;
+GRANT EXECUTE ON FUNCTION public.log_project_job_activity() TO service_role;
+GRANT EXECUTE ON FUNCTION public.log_task_activity() TO service_role;
+GRANT EXECUTE ON FUNCTION public.log_work_timer_stop() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 20260913134454_0266c2fd-b44a-4538-be34-5fa1cd1f45fc.sql
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.ensure_default_work_statuses(_brand_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+BEGIN
+  IF auth.uid() IS NULL OR public.brand_member_role(auth.uid(), _brand_id) IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (_brand_id, 'job', 'Rotina', '#64748b', 0, false, true, null),
+    (_brand_id, 'job', 'Em planejamento/briefing', '#0ea5e9', 1, false, false, null),
+    (_brand_id, 'job', 'Campanha ativa', '#16a34a', 2, false, false, null),
+    (_brand_id, 'job', 'Campanha pausada', '#e0a011', 3, false, false, null),
+    (_brand_id, 'job', 'Atendimento', '#8b5cf6', 4, false, false, null),
+    (_brand_id, 'job', 'Concluído', '#16a34a', 5, true, false, null),
+    (_brand_id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (_brand_id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (_brand_id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (_brand_id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (_brand_id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.ensure_default_work_statuses(uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.ensure_default_work_statuses(uuid) TO authenticated, service_role;
+
+-- ---------------------------------------------------------------------------
+-- 20260913135506_b0fc90c1-d416-44da-aaad-7093f14caacc.sql
+-- ---------------------------------------------------------------------------
+-- start_job_timer também registra activity_events, uma tabela deliberadamente
+-- sem política de escrita para usuários. SECURITY DEFINER é necessário para que
+-- a auditoria seja atômica com o início do timer. A função valida autenticação,
+-- vínculo job/marca e acesso ao projeto antes de qualquer escrita.
+ALTER FUNCTION public.start_job_timer(uuid, uuid) SECURITY DEFINER;
+REVOKE ALL ON FUNCTION public.start_job_timer(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.start_job_timer(uuid, uuid) TO authenticated, service_role;
+
+CREATE INDEX IF NOT EXISTS work_statuses_brand_task_state_idx
+  ON public.work_statuses (brand_id, task_state)
+  WHERE task_state IS NOT NULL;
+
+-- ---------------------------------------------------------------------------
+-- 20260913135541_773dbcaa-c9fa-481d-a2ee-e404cbcc275e.sql
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.start_job_timer(_job_id uuid, _brand_id uuid)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+DECLARE
+  _uid uuid := auth.uid();
+  _new_id uuid;
+  _now timestamptz := now();
+  _project_id uuid;
+BEGIN
+  IF _uid IS NULL THEN RAISE EXCEPTION 'Unauthenticated'; END IF;
+  SELECT project_id INTO _project_id
+  FROM public.project_jobs
+  WHERE id = _job_id AND brand_id = _brand_id;
+  IF _project_id IS NULL OR NOT public.can_access_project(_project_id, _uid) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  UPDATE public.task_time_entries
+  SET ended_at = _now,
+      seconds = GREATEST(0, ROUND(EXTRACT(EPOCH FROM (_now - started_at)))::int),
+      minutes = GREATEST(0, FLOOR(EXTRACT(EPOCH FROM (_now - started_at)) / 60.0)::int),
+      ended_reason = 'auto'
+  WHERE user_id = _uid AND ended_at IS NULL;
+
+  INSERT INTO public.task_time_entries (job_id, user_id, brand_id, started_at, source)
+  VALUES (_job_id, _uid, _brand_id, _now, 'timer')
+  RETURNING id INTO _new_id;
+  RETURN _new_id;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.start_job_timer(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.start_job_timer(uuid, uuid) TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.log_work_timer_start()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE _client_id uuid;
+DECLARE _target_job uuid;
+BEGIN
+  IF NEW.source = 'timer' THEN
+    IF NEW.job_id IS NOT NULL THEN
+      _target_job := NEW.job_id;
+      SELECT p.client_id INTO _client_id
+      FROM public.project_jobs j
+      JOIN public.projects p ON p.id = j.project_id
+      WHERE j.id = NEW.job_id;
+    ELSE
+      SELECT t.job_id, t.client_id INTO _target_job, _client_id
+      FROM public.tasks t WHERE t.id = NEW.task_id;
+    END IF;
+    IF _target_job IS NOT NULL THEN
+      INSERT INTO public.activity_events (brand_id, client_id, actor_id, entity_type, entity_id, verb, payload)
+      VALUES (NEW.brand_id, _client_id, NEW.user_id, 'job', _target_job, 'timer_started',
+        jsonb_build_object('entry_id', NEW.id, 'task_id', NEW.task_id));
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.log_work_timer_start() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.log_work_timer_start() TO service_role;
+
+DROP TRIGGER IF EXISTS task_time_entries_activity_start ON public.task_time_entries;
+CREATE TRIGGER task_time_entries_activity_start
+AFTER INSERT ON public.task_time_entries
+FOR EACH ROW EXECUTE FUNCTION public.log_work_timer_start();
+
+-- ---------------------------------------------------------------------------
+-- 20260913135703_5a3a54a2-9841-4087-9370-bdb91aa1c64b.sql
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.seed_default_work_statuses_for_brand()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (NEW.id, 'job', 'Rotina', '#64748b', 0, false, true, null),
+    (NEW.id, 'job', 'Em planejamento/briefing', '#0ea5e9', 1, false, false, null),
+    (NEW.id, 'job', 'Campanha ativa', '#16a34a', 2, false, false, null),
+    (NEW.id, 'job', 'Campanha pausada', '#e0a011', 3, false, false, null),
+    (NEW.id, 'job', 'Atendimento', '#8b5cf6', 4, false, false, null),
+    (NEW.id, 'job', 'Concluído', '#16a34a', 5, true, false, null),
+    (NEW.id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (NEW.id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (NEW.id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (NEW.id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (NEW.id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.seed_default_work_statuses_for_brand() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.seed_default_work_statuses_for_brand() TO service_role;
+
+DROP TRIGGER IF EXISTS brands_seed_default_work_statuses ON public.brands;
+CREATE TRIGGER brands_seed_default_work_statuses
+AFTER INSERT ON public.brands
+FOR EACH ROW EXECUTE FUNCTION public.seed_default_work_statuses_for_brand();
+
+-- ---------------------------------------------------------------------------
+-- 20260913141200_0663bffc-8419-4e99-8680-0003cd8d5eb2.sql
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.duplicate_project_job(_job_id uuid, _brand_id uuid)
+RETURNS uuid
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+DECLARE
+  _uid uuid := auth.uid();
+  _source public.project_jobs%ROWTYPE;
+  _new_job_id uuid;
+  _next_position integer;
+BEGIN
+  IF _uid IS NULL THEN
+    RAISE EXCEPTION 'Unauthenticated';
+  END IF;
+
+  SELECT * INTO _source
+  FROM public.project_jobs
+  WHERE id = _job_id
+    AND brand_id = _brand_id;
+
+  IF _source.id IS NULL OR NOT public.can_access_project(_source.project_id, _uid) THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  SELECT COALESCE(MAX(position), -1) + 1 INTO _next_position
+  FROM public.project_jobs
+  WHERE project_id = _source.project_id;
+
+  INSERT INTO public.project_jobs (
+    project_id, brand_id, name, description, color, position,
+    assignee_id, start_date, due_at, status_id, estimated_minutes
+  ) VALUES (
+    _source.project_id, _source.brand_id, _source.name || ' (cópia)',
+    _source.description, _source.color, _next_position,
+    _source.assignee_id, _source.start_date, _source.due_at,
+    _source.status_id, _source.estimated_minutes
+  )
+  RETURNING id INTO _new_job_id;
+
+  INSERT INTO public.tasks (
+    brand_id, client_id, project_id, job_id, title, description,
+    status, priority, assignee_id, due_at, start_date, status_id,
+    done, done_at, estimated_minutes, total_minutes, position, created_by
+  )
+  SELECT
+    brand_id, client_id, project_id, _new_job_id, title, description,
+    status, priority, assignee_id, due_at, start_date, status_id,
+    done, CASE WHEN done THEN now() ELSE NULL END,
+    estimated_minutes, 0, position, _uid
+  FROM public.tasks
+  WHERE job_id = _source.id
+    AND brand_id = _brand_id
+    AND archived_at IS NULL
+  ORDER BY position, created_at;
+
+  RETURN _new_job_id;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.duplicate_project_job(uuid, uuid) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.duplicate_project_job(uuid, uuid) TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION public.ensure_default_work_statuses(_brand_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+BEGIN
+  IF auth.uid() IS NULL OR public.brand_member_role(auth.uid(), _brand_id) IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (_brand_id, 'job', 'Não iniciado', '#64748b', 10, false, false, null),
+    (_brand_id, 'job', 'Em andamento', '#0ea5e9', 11, false, false, null),
+    (_brand_id, 'job', 'Em revisão', '#e0a011', 12, false, false, null),
+    (_brand_id, 'job', 'Bloqueado', '#dc2626', 13, false, false, null),
+    (_brand_id, 'job', 'Concluído', '#16a34a', 14, true, false, null),
+    (_brand_id, 'job', 'Rotina', '#64748b', 0, false, true, null),
+    (_brand_id, 'job', 'Em planejamento/briefing', '#0ea5e9', 1, false, false, null),
+    (_brand_id, 'job', 'Campanha ativa', '#16a34a', 2, false, false, null),
+    (_brand_id, 'job', 'Campanha pausada', '#e0a011', 3, false, false, null),
+    (_brand_id, 'job', 'Atendimento', '#8b5cf6', 4, false, false, null),
+    (_brand_id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (_brand_id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (_brand_id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (_brand_id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (_brand_id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.seed_default_work_statuses_for_brand()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (NEW.id, 'job', 'Não iniciado', '#64748b', 10, false, false, null),
+    (NEW.id, 'job', 'Em andamento', '#0ea5e9', 11, false, false, null),
+    (NEW.id, 'job', 'Em revisão', '#e0a011', 12, false, false, null),
+    (NEW.id, 'job', 'Bloqueado', '#dc2626', 13, false, false, null),
+    (NEW.id, 'job', 'Concluído', '#16a34a', 14, true, false, null),
+    (NEW.id, 'job', 'Rotina', '#64748b', 0, false, true, null),
+    (NEW.id, 'job', 'Em planejamento/briefing', '#0ea5e9', 1, false, false, null),
+    (NEW.id, 'job', 'Campanha ativa', '#16a34a', 2, false, false, null),
+    (NEW.id, 'job', 'Campanha pausada', '#e0a011', 3, false, false, null),
+    (NEW.id, 'job', 'Atendimento', '#8b5cf6', 4, false, false, null),
+    (NEW.id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (NEW.id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (NEW.id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (NEW.id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (NEW.id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+REVOKE ALL ON FUNCTION public.seed_default_work_statuses_for_brand() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.seed_default_work_statuses_for_brand() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 20260913142809_b0fea0d7-9a8c-4776-9c71-b2ee29e1ca24.sql
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.ensure_default_work_statuses(_brand_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+BEGIN
+  IF auth.uid() IS NULL OR public.brand_member_role(auth.uid(), _brand_id) IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (_brand_id, 'project', 'Rascunho', '#64748b', 0, false, true, null),
+    (_brand_id, 'project', 'Em planejamento', '#0ea5e9', 1, false, false, null),
+    (_brand_id, 'project', 'Ativa', '#16a34a', 2, false, false, null),
+    (_brand_id, 'project', 'Pausada', '#e0a011', 3, false, false, null),
+    (_brand_id, 'project', 'Aguardando cliente', '#8b5cf6', 4, false, false, null),
+    (_brand_id, 'project', 'Concluído', '#16a34a', 5, true, false, null),
+    (_brand_id, 'job', 'Não iniciado', '#64748b', 10, false, false, null),
+    (_brand_id, 'job', 'Em andamento', '#0ea5e9', 11, false, false, null),
+    (_brand_id, 'job', 'Em revisão', '#e0a011', 12, false, false, null),
+    (_brand_id, 'job', 'Bloqueado', '#dc2626', 13, false, false, null),
+    (_brand_id, 'job', 'Concluído', '#16a34a', 14, true, false, null),
+    (_brand_id, 'job', 'Rotina', '#64748b', 0, false, true, null),
+    (_brand_id, 'job', 'Em planejamento/briefing', '#0ea5e9', 1, false, false, null),
+    (_brand_id, 'job', 'Campanha ativa', '#16a34a', 2, false, false, null),
+    (_brand_id, 'job', 'Campanha pausada', '#e0a011', 3, false, false, null),
+    (_brand_id, 'job', 'Atendimento', '#8b5cf6', 4, false, false, null),
+    (_brand_id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (_brand_id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (_brand_id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (_brand_id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (_brand_id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.seed_default_work_statuses_for_brand()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (NEW.id, 'project', 'Rascunho', '#64748b', 0, false, true, null),
+    (NEW.id, 'project', 'Em planejamento', '#0ea5e9', 1, false, false, null),
+    (NEW.id, 'project', 'Ativa', '#16a34a', 2, false, false, null),
+    (NEW.id, 'project', 'Pausada', '#e0a011', 3, false, false, null),
+    (NEW.id, 'project', 'Aguardando cliente', '#8b5cf6', 4, false, false, null),
+    (NEW.id, 'project', 'Concluído', '#16a34a', 5, true, false, null),
+    (NEW.id, 'job', 'Não iniciado', '#64748b', 10, false, false, null),
+    (NEW.id, 'job', 'Em andamento', '#0ea5e9', 11, false, false, null),
+    (NEW.id, 'job', 'Em revisão', '#e0a011', 12, false, false, null),
+    (NEW.id, 'job', 'Bloqueado', '#dc2626', 13, false, false, null),
+    (NEW.id, 'job', 'Concluído', '#16a34a', 14, true, false, null),
+    (NEW.id, 'job', 'Rotina', '#64748b', 0, false, true, null),
+    (NEW.id, 'job', 'Em planejamento/briefing', '#0ea5e9', 1, false, false, null),
+    (NEW.id, 'job', 'Campanha ativa', '#16a34a', 2, false, false, null),
+    (NEW.id, 'job', 'Campanha pausada', '#e0a011', 3, false, false, null),
+    (NEW.id, 'job', 'Atendimento', '#8b5cf6', 4, false, false, null),
+    (NEW.id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (NEW.id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (NEW.id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (NEW.id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (NEW.id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 20260913144106_c2e77643-8d15-4ae9-b398-390fd6dcf01a.sql
+-- ---------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.ensure_default_work_statuses(_brand_id uuid)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY INVOKER
+SET search_path = public
+AS $$
+BEGIN
+  IF auth.uid() IS NULL OR public.brand_member_role(auth.uid(), _brand_id) IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (_brand_id, 'project', 'Rascunho', '#64748b', 0, false, true, null),
+    (_brand_id, 'project', 'Em planejamento', '#0ea5e9', 1, false, false, null),
+    (_brand_id, 'project', 'Ativa', '#16a34a', 2, false, false, null),
+    (_brand_id, 'project', 'Pausada', '#e0a011', 3, false, false, null),
+    (_brand_id, 'project', 'Aguardando cliente', '#8b5cf6', 4, false, false, null),
+    (_brand_id, 'project', 'Concluído', '#16a34a', 5, true, false, null),
+    (_brand_id, 'job', 'Não iniciado', '#64748b', 0, false, true, null),
+    (_brand_id, 'job', 'Em andamento', '#0ea5e9', 1, false, false, null),
+    (_brand_id, 'job', 'Em revisão', '#e0a011', 2, false, false, null),
+    (_brand_id, 'job', 'Bloqueado', '#dc2626', 3, false, false, null),
+    (_brand_id, 'job', 'Concluído', '#16a34a', 4, true, false, null),
+    (_brand_id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (_brand_id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (_brand_id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (_brand_id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (_brand_id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO UPDATE
+  SET color = EXCLUDED.color,
+      position = EXCLUDED.position,
+      is_done = EXCLUDED.is_done,
+      is_default = EXCLUDED.is_default,
+      task_state = EXCLUDED.task_state;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.seed_default_work_statuses_for_brand()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+  INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+  VALUES
+    (NEW.id, 'project', 'Rascunho', '#64748b', 0, false, true, null),
+    (NEW.id, 'project', 'Em planejamento', '#0ea5e9', 1, false, false, null),
+    (NEW.id, 'project', 'Ativa', '#16a34a', 2, false, false, null),
+    (NEW.id, 'project', 'Pausada', '#e0a011', 3, false, false, null),
+    (NEW.id, 'project', 'Aguardando cliente', '#8b5cf6', 4, false, false, null),
+    (NEW.id, 'project', 'Concluído', '#16a34a', 5, true, false, null),
+    (NEW.id, 'job', 'Não iniciado', '#64748b', 0, false, true, null),
+    (NEW.id, 'job', 'Em andamento', '#0ea5e9', 1, false, false, null),
+    (NEW.id, 'job', 'Em revisão', '#e0a011', 2, false, false, null),
+    (NEW.id, 'job', 'Bloqueado', '#dc2626', 3, false, false, null),
+    (NEW.id, 'job', 'Concluído', '#16a34a', 4, true, false, null),
+    (NEW.id, 'task', 'A fazer', '#64748b', 0, false, true, 'todo'),
+    (NEW.id, 'task', 'Fazendo', '#0ea5e9', 1, false, false, 'in_progress'),
+    (NEW.id, 'task', 'Em revisão', '#e0a011', 2, false, false, 'review'),
+    (NEW.id, 'task', 'Bloqueada', '#dc2626', 3, false, false, 'blocked'),
+    (NEW.id, 'task', 'Concluída', '#16a34a', 4, true, false, 'done')
+  ON CONFLICT (brand_id, scope, lower(name)) DO NOTHING;
+  RETURN NEW;
+END;
+$$;
+
+DO $$
+DECLARE
+  brand record;
+  source_status record;
+  target_id uuid;
+  target_name text;
+BEGIN
+  FOR brand IN SELECT id FROM public.brands LOOP
+    INSERT INTO public.work_statuses (brand_id, scope, name, color, position, is_done, is_default, task_state)
+    VALUES
+      (brand.id, 'job', 'Não iniciado', '#64748b', 0, false, true, null),
+      (brand.id, 'job', 'Em andamento', '#0ea5e9', 1, false, false, null),
+      (brand.id, 'job', 'Em revisão', '#e0a011', 2, false, false, null),
+      (brand.id, 'job', 'Bloqueado', '#dc2626', 3, false, false, null),
+      (brand.id, 'job', 'Concluído', '#16a34a', 4, true, false, null)
+    ON CONFLICT (brand_id, scope, lower(name)) DO UPDATE
+    SET color = EXCLUDED.color,
+        position = EXCLUDED.position,
+        is_done = EXCLUDED.is_done,
+        is_default = EXCLUDED.is_default;
+
+    FOR source_status IN
+      SELECT id, name
+      FROM public.work_statuses
+      WHERE brand_id = brand.id
+        AND scope = 'job'
+        AND lower(name) IN ('rotina', 'em planejamento/briefing', 'campanha ativa', 'campanha pausada', 'atendimento')
+    LOOP
+      target_name := CASE lower(source_status.name)
+        WHEN 'rotina' THEN 'Não iniciado'
+        WHEN 'campanha pausada' THEN 'Bloqueado'
+        ELSE 'Em andamento'
+      END;
+
+      SELECT id INTO target_id
+      FROM public.work_statuses
+      WHERE brand_id = brand.id AND scope = 'job' AND lower(name) = lower(target_name)
+      LIMIT 1;
+
+      UPDATE public.project_jobs SET status_id = target_id WHERE status_id = source_status.id;
+      DELETE FROM public.work_statuses WHERE id = source_status.id;
+    END LOOP;
+  END LOOP;
+END;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- 20260913144148_2a8c5ef9-bc2a-4333-8a91-e9aba5b6fc7a.sql
+-- ---------------------------------------------------------------------------
+REVOKE ALL ON FUNCTION public.seed_default_work_statuses_for_brand() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.seed_default_work_statuses_for_brand() TO service_role;
+
+-- ---------------------------------------------------------------------------
+-- 20260913160318_0e170cac-a65c-4bfe-96e4-93addf3780ff.sql
+-- ---------------------------------------------------------------------------
+SELECT 1;

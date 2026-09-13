@@ -386,6 +386,52 @@ WITH checks AS (
                     )
               THEN 'PASS' ELSE 'FAIL' END
 
+  UNION ALL
+  SELECT 57, 'Jobs: numeração, status e timer direto instalados',
+         format('contador=%s colunas=%s xor=%s funções=%s triggers=%s status_projeto=%s status_job=%s legados_job=%s',
+           to_regclass('public.project_job_counters') IS NOT NULL,
+           (SELECT count(*) FROM information_schema.columns
+             WHERE table_schema = 'public'
+               AND (table_name, column_name) IN (('project_jobs','job_number'),('project_jobs','estimated_minutes'),('work_statuses','task_state'),('task_time_entries','job_id'))),
+           EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'task_time_entries_one_target'),
+           (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+             WHERE n.nspname = 'public' AND p.proname IN ('start_job_timer','ensure_default_work_statuses','log_work_timer_start','seed_default_work_statuses_for_brand','duplicate_project_job')),
+           (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('project_jobs_assign_number','project_jobs_number_immutable','task_time_entries_activity_start','brands_seed_default_work_statuses')),
+            (SELECT count(DISTINCT lower(name)) FROM public.work_statuses WHERE scope = 'project' AND lower(name) IN ('rascunho','em planejamento','ativa','pausada','aguardando cliente','concluído')),
+            (SELECT count(DISTINCT lower(name)) FROM public.work_statuses WHERE scope = 'job' AND lower(name) IN ('não iniciado','em andamento','em revisão','bloqueado','concluído')),
+            (SELECT count(*) FROM public.work_statuses WHERE scope = 'job' AND lower(name) IN ('rotina','em planejamento/briefing','campanha ativa','campanha pausada','atendimento'))),
+         CASE WHEN to_regclass('public.project_job_counters') IS NOT NULL
+                    AND (SELECT count(*) FROM information_schema.columns
+                          WHERE table_schema = 'public'
+                            AND (table_name, column_name) IN (('project_jobs','job_number'),('project_jobs','estimated_minutes'),('work_statuses','task_state'),('task_time_entries','job_id'))) = 4
+                    AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'project_jobs_brand_number_unique')
+                    AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'project_jobs_estimated_minutes_nonnegative')
+                    AND EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'task_time_entries_one_target')
+                     AND (SELECT count(*) FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                           WHERE n.nspname = 'public' AND p.proname IN ('start_job_timer','ensure_default_work_statuses','log_work_timer_start','seed_default_work_statuses_for_brand','duplicate_project_job')) = 5
+                    AND (SELECT count(*) FROM pg_trigger WHERE NOT tgisinternal AND tgname IN ('project_jobs_assign_number','project_jobs_number_immutable','task_time_entries_activity_start','brands_seed_default_work_statuses')) = 4
+                    AND NOT has_function_privilege('anon', 'public.start_job_timer(uuid,uuid)', 'EXECUTE')
+                     AND NOT has_function_privilege('anon', 'public.ensure_default_work_statuses(uuid)', 'EXECUTE')
+                     AND NOT has_function_privilege('anon', 'public.duplicate_project_job(uuid,uuid)', 'EXECUTE')
+                     AND NOT EXISTS (
+                       SELECT 1 FROM public.brands b
+                       WHERE (SELECT count(DISTINCT lower(ws.name)) FROM public.work_statuses ws
+                              WHERE ws.brand_id = b.id AND ws.scope = 'project'
+                                AND lower(ws.name) IN ('rascunho','em planejamento','ativa','pausada','aguardando cliente','concluído')) < 6
+                     )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM public.brands b
+                        WHERE (SELECT count(DISTINCT lower(ws.name)) FROM public.work_statuses ws
+                               WHERE ws.brand_id = b.id AND ws.scope = 'job'
+                                 AND lower(ws.name) IN ('não iniciado','em andamento','em revisão','bloqueado','concluído')) < 5
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM public.work_statuses
+                        WHERE scope = 'job'
+                          AND lower(name) IN ('rotina','em planejamento/briefing','campanha ativa','campanha pausada','atendimento')
+                      )
+              THEN 'PASS' ELSE 'FAIL' END
+
   -- ----------------------------------------------------------------- vault / cron
   UNION ALL
   SELECT 60, 'vault: cron_secret presente e com tamanho mínimo',
@@ -465,7 +511,8 @@ WITH checks AS (
                'messages','portal_notification_prefs','post_client_comments','post_copy_queue_state',
                'client_ad_accounts','project_participants','user_login_events','work_comments',
                 'work_links','work_statuses','client_automation_attempts',
-                'client_automation_dates','client_automation_dispatches','client_automation_rules'
+                 'client_automation_dates','client_automation_dispatches','client_automation_rules',
+                 'project_job_counters'
              ]) AS t
              WHERE to_regclass('public.' || t) IS NULL
            ) faltando
@@ -480,7 +527,8 @@ WITH checks AS (
              'messages','portal_notification_prefs','post_client_comments','post_copy_queue_state',
              'client_ad_accounts','project_participants','user_login_events','work_comments',
               'work_links','work_statuses','client_automation_attempts',
-              'client_automation_dates','client_automation_dispatches','client_automation_rules'
+               'client_automation_dates','client_automation_dispatches','client_automation_rules',
+               'project_job_counters'
            ]) AS t
            WHERE to_regclass('public.' || t) IS NULL
          ) THEN 'PASS' ELSE 'FAIL' END

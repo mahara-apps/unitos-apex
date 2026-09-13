@@ -1,5 +1,33 @@
 # Roadmap
 
+## MASTER 1.3.73 — Drawer de Jobs
+
+- Drawer de job ampliado sem alterar `/projects/$projectId?tab=jobs&job=<uuid>`.
+- Número imutável por workspace, timer direto e estimativa de job.
+- Status pesquisáveis de job e tarefa, briefing rico sanitizado e subtarefas.
+- Painel lateral com Comentários, Anexos, Timesheet e Histórico.
+
+## MASTER 1.3.74 — Lista de Jobs
+
+- [x] Lista densa com número, progresso, tempo, equipe, prazo, status e ações.
+- [x] Agrupamento por status, responsável ou prazo e quadro arrastável por status.
+- [x] Duplicação transacional de job e tarefas sem copiar horas, conversas ou anexos.
+- [ ] Publicar e propagar somente após autorização explícita.
+
+## MASTER 1.3.75 — Visão geral do projeto
+
+- [x] Cabeçalho compacto com status pesquisável, pauta, responsável e ações preservadas.
+- [x] Indicadores canônicos, pipeline contínuo, resumo de jobs, pautas, entregas e atividade real.
+- [x] Manter `/projects/$projectId` e todos os parâmetros e abas existentes.
+- [ ] Publicar e propagar somente após autorização explícita.
+
+## MASTER 1.3.76 — Lista de Jobs fiel ao padrão de tarefas
+
+- [x] Linha densa com progresso, tempo ativo, equipe, prazo, status pesquisável e menu completo.
+- [x] Acessos separados para Jobs e Pautas, grupos de status e quadro alinhados à referência Operand.
+- [x] Migrar os status legados para os cinco estados oficiais sem remover status personalizados.
+- [ ] Publicar e propagar somente após autorização explícita.
+
 - [x] Reformular visualmente lista, detalhe e painel de job da área Projetos; preservar ações e sincronizar MASTER 1.3.66.
 - [x] Adicionar reenvio/edição de convites e ocultar o Super Admin global de listas e menções; sincronizar MASTER.
 - [x] Corrigir conclusão prematura do deploy por Git e reconciliar a versão registrada da Casa 8.
